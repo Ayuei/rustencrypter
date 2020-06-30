@@ -37,3 +37,4 @@ You can chain multiple encryptions and decryptions symmetrically for added secur
 - [ ] Refactor for speed using callbacks
 - [ ] Fix some race conditions in the test cases
 - [ ] Multi-threads or Async for directory encryption/decryption
+- [ ] Add python bindings (personal project)
