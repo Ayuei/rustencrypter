@@ -32,7 +32,7 @@ You can chain multiple encryptions and decryptions symmetrically for added secur
 ```
 
 ## TODOs
-- [ ] release compiled binaries for all platforms
+- [ ] Release compiled binaries for all platforms
 - [ ] Add authentication for tamper detection (signatures)
 - [ ] Add support for embedded encryption and decryption chaining
 - [ ] Refactor for speed using callbacks
