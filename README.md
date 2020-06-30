@@ -4,7 +4,7 @@ An encryption tool for directories and files written purely in Rust. Uses AES-GC
 ## Installation
 ```bash
 git clone https://github.com/Ayuei/rustencrypter.git
-cargo install rustencrypter
+cargo install --path rustencrypter
 ```
 
 ## Usage
