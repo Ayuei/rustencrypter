@@ -36,3 +36,4 @@ You can chain multiple encryptions and decryptions symmetrically for added secur
 - [ ] Add support for embedded encryption and decryption chaining
 - [ ] Refactor for speed using callbacks
 - [ ] Fix some race conditions in the test cases
+- [ ] Multi-threads for directory encryption/decryption
