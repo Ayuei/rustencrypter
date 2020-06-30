@@ -40,8 +40,8 @@ You can chain multiple encryptions and decryptions symmetrically for added secur
 - [ ] Add an optional flag for an output file
 - [ ] Add authentication for tamper detection (signatures)
 - [ ] Add support for embedded encryption and decryption chaining
-- [ ] Refactor for speed using callbacks
-- [ ] Fix some race conditions in the test cases
+- [x] Refactor for speed using callbacks
+- [x] Fix some race conditions in the test cases
 - [ ] Multi-threads or Async for directory encryption/decryption
 - [ ] Add python bindings (personal project)
 
