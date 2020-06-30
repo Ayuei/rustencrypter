@@ -6,7 +6,7 @@ use std::io::prelude::*;
 use std::path::{PathBuf, Path};
 use rand::prelude::*;
 use aes_gcm::Aes128Gcm;
-use aes_gcm::aead::{Aead, NewAead, generic_array};
+use aes_gcm::aead::{Aead, NewAead, generic_array::{ArrayLength, GenericArray}};
 use aes_gcm::aead::generic_array::typenum::consts::{U12, U16};
 use structopt::{StructOpt, clap::ArgGroup};
 use walkdir::WalkDir;
@@ -52,26 +52,26 @@ impl error::Error for CryptoError {
 }
 
 /// Generate a fresh key with a CSPRNG
-pub fn generate_key() -> generic_array::GenericArray<u8, U16> {
+pub fn generate_key() -> GenericArray<u8, U16> {
     let mut key = [0; 16];
     let mut rng = rand::thread_rng();
     rng.fill_bytes(&mut key);
-    *generic_array::GenericArray::from_slice(&key)
+    *GenericArray::from_slice(&key)
 }
 
 /// Generate a fresh nonce for every encryption from CSPRNG
-pub fn generate_nonce() -> generic_array::GenericArray<u8, U12> {
+pub fn generate_nonce() -> GenericArray<u8, U12> {
     let mut rng = rand::thread_rng();
     let mut nonce = [0; 12];
     rng.fill_bytes(&mut nonce);
-    *generic_array::GenericArray::from_slice(&nonce) // 96-bits; unique per message
+    *GenericArray::from_slice(&nonce) // 96-bits; unique per message
 }
 
 /// Generate a key to given file if it doesn't exist
-pub fn check_key_file(file: &PathBuf) -> generic_array::GenericArray<u8, U16> {
+pub fn check_key_file(file: &PathBuf) -> GenericArray<u8, U16> {
     if Path::new(&file).exists() {
         // Load old key
-        *generic_array::GenericArray::from_slice(&fs::read(file).unwrap())
+        *GenericArray::from_slice(&fs::read(file).unwrap())
     } else {
         // Create a new key
         let mut file = fs::File::create(&file).unwrap();
@@ -125,7 +125,7 @@ pub fn encrypt_cb(contents: Vec<u8>, cipher: &Aes128Gcm) -> Result<Vec<u8>, Box<
 /// Decryption callback
 pub fn decrypt_cb(contents: Vec<u8>, cipher: &Aes128Gcm) -> Result<Vec<u8>, Box<dyn error::Error>> {
     let len = contents.len();
-    let nonce = generic_array::GenericArray::from_slice(&contents[len-12..len]);
+    let nonce = GenericArray::from_slice(&contents[len-12..len]);
     let plaintext = cipher.decrypt(nonce, contents[0..len-12].as_ref()).or(Err(Box::new(CryptoError::DecryptFail)))?;
     Ok(plaintext)
 }
@@ -135,7 +135,7 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn encrypt_decrypt(key: generic_array::GenericArray<u8, U16>, nonce: generic_array::GenericArray<u8, U12>) -> Vec<u8> {
+    fn encrypt_decrypt(key: GenericArray<u8, U16>, nonce: GenericArray<u8, U12>) -> Vec<u8> {
         let cipher = Aes128Gcm::new(&key);
         let contents = b"plaintext message";
 
@@ -144,21 +144,21 @@ mod tests {
         let len = ciphertext.len();
         let nonce_size = nonce.len();
 
-        let nonce = generic_array::GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
+        let nonce = GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
         cipher.decrypt(&nonce, ciphertext[0..len-nonce_size].as_ref()).unwrap()
     }
 
     #[test]
     fn check_key_gen() {
         let key = generate_key();
-        let nonce = *generic_array::GenericArray::from_slice(&[0; 12]);
+        let nonce = *GenericArray::from_slice(&[0; 12]);
 
         assert_eq!(encrypt_decrypt(key, nonce), b"plaintext message");
     }
 
     #[test]
     fn check_nonce_gen() {
-        let key= *generic_array::GenericArray::from_slice(&[0; 16]);
+        let key= *GenericArray::from_slice(&[0; 16]);
         let nonce = generate_nonce();
 
         assert_eq!(encrypt_decrypt(key, nonce), b"plaintext message");
@@ -196,7 +196,7 @@ mod tests {
         let len = ciphertext.len();
         let nonce_size = 12;
 
-        let nonce = generic_array::GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
+        let nonce = GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
         let plaintext = cipher.decrypt(nonce, ciphertext[0..len-nonce_size].as_ref()).unwrap();
 
         fs::remove_file("test").unwrap();
@@ -251,13 +251,13 @@ mod tests {
 
         // Decrypt 
         let key_data = fs::read("key").unwrap();
-        let key = generic_array::GenericArray::from_slice(&key_data);
+        let key = GenericArray::from_slice(&key_data);
         let cipher = Aes128Gcm::new(&key);
 
         let len = result.len();
         let nonce_size = 12;
 
-        let nonce = generic_array::GenericArray::from_slice(&result[len-nonce_size..len]);
+        let nonce = GenericArray::from_slice(&result[len-nonce_size..len]);
         let plaintext = cipher.decrypt(nonce, result[0..len-nonce_size].as_ref()).unwrap();
 
         fs::remove_file("test_not_exists").unwrap();
@@ -304,7 +304,7 @@ mod tests {
                 let len = ciphertext.len();
                 let nonce_size = 12;
 
-                let nonce = generic_array::GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
+                let nonce = GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
                 let plaintext = cipher.decrypt(nonce, ciphertext[0..len-nonce_size].as_ref()).unwrap();
 
                 assert_eq!(key.to_vec(), plaintext);
