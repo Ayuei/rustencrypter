@@ -1,5 +1,5 @@
-# rustencrypter
-An encryption tool for directories and files written purely in Rust. Uses AES-GCM with 128 bit encryption. 
+# rustencrypter-cli
+An encryption cli tool for directories and files written purely in Rust. Uses AES-GCM with 128 bit encryption. 
 
 ## Installation
 ```bash
@@ -32,6 +32,7 @@ You can chain multiple encryptions and decryptions symmetrically for added secur
 ```
 
 ## TODOs
+- [ ] release compiled binaries for all platforms
 - [ ] Add authentication for tamper detection (signatures)
 - [ ] Add support for embedded encryption and decryption chaining
 - [ ] Refactor for speed using callbacks
