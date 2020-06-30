@@ -12,6 +12,7 @@ cargo install --path rustencrypter
 ./rustencrypter <input file> <--[e]ncrypt|--[d]ecrypt> --[k]ey <key file>
 ```
 **Note encryption and decryption will overwrite the source file, this will be altered in future with a flag**
+
 *You can only do a single encrypt or decrypt operation per call*
 
 
