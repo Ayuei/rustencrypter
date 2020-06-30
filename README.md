@@ -9,7 +9,7 @@ cargo build --release
 
 ## Usage
 ```
-./rustencrypter <input file> <--encrypt|--decrypt>
+./rustencrypter <input file> <--[e]ncrypt|--[d]ecrypt> --[k]ey <key file>
 ```
 
 **Note you can only do a single encrypt or decrypt operation per call**
