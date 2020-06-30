@@ -11,8 +11,9 @@ cargo install --path rustencrypter
 ```
 ./rustencrypter <input file> <--[e]ncrypt|--[d]ecrypt> --[k]ey <key file>
 ```
+**Note encryption and decryption will overwrite the source file, this will be altered in future with a flag**
+*You can only do a single encrypt or decrypt operation per call*
 
-**Note you can only do a single encrypt or decrypt operation per call**
 
 ## Features
 - [x] Encrypt a file
@@ -33,9 +34,12 @@ You can chain multiple encryptions and decryptions symmetrically for added secur
 
 ## TODOs
 - [ ] Release compiled binaries for all platforms
+- [ ] Add an optional flag for an output file
 - [ ] Add authentication for tamper detection (signatures)
 - [ ] Add support for embedded encryption and decryption chaining
 - [ ] Refactor for speed using callbacks
 - [ ] Fix some race conditions in the test cases
 - [ ] Multi-threads or Async for directory encryption/decryption
 - [ ] Add python bindings (personal project)
+
+Feel to do any pull requests or let me know about any issues. 
