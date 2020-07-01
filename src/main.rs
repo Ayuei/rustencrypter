@@ -1,5 +1,4 @@
 use rustencrypter::{run, Opt, encrypt_cb, decrypt_cb};
-use aes_gcm::Aes128Gcm;
 use std::process;
 use std::error;
 use structopt::StructOpt;
@@ -7,7 +6,7 @@ use structopt::StructOpt;
 fn main() {
     let opt = Opt::from_args();
 
-    let cb: &dyn Fn(Vec<u8>, &Aes128Gcm) -> Result<Vec<u8>, Box<dyn error::Error>>  = {
+    let cb: &dyn Fn(Vec<u8>, &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>>  = {
         if opt.encrypt {
             &encrypt_cb
         } else {
