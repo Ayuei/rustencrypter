@@ -6,7 +6,7 @@ use structopt::StructOpt;
 fn main() {
     let opt = Opt::from_args();
 
-    let cb: &dyn Fn(Vec<u8>, &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>>  = {
+    let cb: &dyn Fn(&mut Vec<u8>, &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>>  = {
         if opt.encrypt {
             &encrypt_cb
         } else {

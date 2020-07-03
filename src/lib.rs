@@ -10,6 +10,11 @@ use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
 use aes_gcm::aead::generic_array::typenum::consts::U12;
 use structopt::{StructOpt, clap::ArgGroup};
 use walkdir::WalkDir;
+use hmac::{Hmac, Mac, NewMac};
+use blake2::Blake2b;
+
+const NONCE_SIZE: usize = 12;
+const HMAC_SIZE: usize = 64;
 
 // Parse arguments for the CLI
 #[derive(StructOpt, Debug)]
@@ -54,8 +59,29 @@ impl error::Error for CryptoError {
     }
 }
 
+type Hash = Blake2b;
+type HmacBlake2 = Hmac<Hash>;
+
+/// Generate HMAC for message authentication and tamper detection
+pub fn generate_hmac(msg: &Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>>{
+    let mut mac = HmacBlake2::new_varkey(key)?;
+    mac.update(msg);
+
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+pub fn verify_hmac(msg: &Vec<u8>, key: &Vec<u8>, tag: Vec<u8>) -> Result<(), Box<dyn error::Error>>{
+    let mut mac = HmacBlake2::new_varkey(key)?;
+    mac.update(&msg);
+
+    // Strip and return the HMAC tag
+    mac.verify(tag.as_slice())?;
+
+    Ok(())
+}
+
 /// Generate a fresh key with a CSPRNG
-/// We can determine keylength be specified boolean
+/// We can determine key length be specified boolean
 pub fn generate_key(key256: bool) -> Vec<u8> {
     let mut rng = rand::thread_rng();
     let mut key: Vec<u8> = {
@@ -73,7 +99,7 @@ pub fn generate_key(key256: bool) -> Vec<u8> {
 /// Generate a fresh nonce for every encryption from CSPRNG
 pub fn generate_nonce() -> GenericArray<u8, U12> {
     let mut rng = rand::thread_rng();
-    let mut nonce = [0; 12];
+    let mut nonce = [0; NONCE_SIZE];
     rng.fill_bytes(&mut nonce);
     *GenericArray::from_slice(&nonce) // 96-bits; unique per message
 }
@@ -92,11 +118,12 @@ pub fn check_key_file(file: &PathBuf, key256: bool) -> Vec<u8> {
     }
 }
 
+
 // TODO decouple OPT dependency from the function and simply parse it from main
 /// Run an encryption or decryption task from main function
 pub fn run(
     opts: Opt, 
-    cb: &dyn Fn(Vec<u8>, &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> 
+    cb: &dyn Fn(&mut Vec<u8>, &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> 
 ) -> Result<(), Box<dyn error::Error>> {
 
     let key = match opts.key {
@@ -114,17 +141,17 @@ pub fn run(
         // Walk through directories for any files
         for entry in WalkDir::new(&opts.infile).into_iter().filter_map(|e| e.ok()).filter(|e| e.path().is_file()) {
             println!("Consuming {}", entry.path().display()); // alert user what we're doing (loading bar may be more appropriate)
-            fs::write(entry.path(), cb(fs::read(entry.path())?, &key)?)?
+            fs::write(entry.path(), cb(&mut fs::read(entry.path())?, &key)?)?
         }
     } else {
-        fs::write(&opts.infile, cb(fs::read(&opts.infile)?, &key)?)?
+        fs::write(&opts.infile, cb(&mut fs::read(&opts.infile)?, &key)?)?
     };
 
     Ok(())
 }
 
 /// Encryption callback
-pub fn encrypt_cb(contents: Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> {
+pub fn encrypt_cb(contents: &mut Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> {
     let nonce = generate_nonce();
     let mut ciphertext = {
         if key.len() == 32 {
@@ -137,22 +164,31 @@ pub fn encrypt_cb(contents: Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn e
     };
 
     ciphertext.append(&mut nonce.to_vec());
+    ciphertext.append(&mut generate_hmac(&ciphertext, &key)?);
+    println!("{:?}", ciphertext[ciphertext.len()-HMAC_SIZE..ciphertext.len()].to_vec());
     Ok(ciphertext)
 }
 
 /// Decryption callback
-pub fn decrypt_cb(contents: Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> {
-    let len = contents.len();
-    let nonce = GenericArray::from_slice(&contents[len-12..len]);
+pub fn decrypt_cb(contents: &mut Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> {
+    let hmac: Vec<u8> = contents.drain(contents.len()-HMAC_SIZE..).collect();
+
+    // Verify that the message is authentic before we do anything else
+    verify_hmac(&contents, &key, hmac)?;
+
+    let drain: Vec<u8> = contents.drain(contents.len()-NONCE_SIZE..).collect();
+    let nonce = GenericArray::from_slice(drain.as_slice());
+
     let plaintext = {
         if key.len() == 32 {
             let cipher = Aes256Gcm::new(GenericArray::from_slice(key.as_slice()));
-            cipher.decrypt(nonce, contents[0..len-12].as_ref()).or(Err(Box::new(CryptoError::DecryptFail)))?
+            cipher.decrypt(nonce, contents.as_ref()).or(Err(Box::new(CryptoError::DecryptFail)))?
         } else {
             let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_slice()));
-            cipher.decrypt(nonce, contents[0..len-12].as_ref()).or(Err(Box::new(CryptoError::DecryptFail)))?
+            cipher.decrypt(nonce, contents.as_ref()).or(Err(Box::new(CryptoError::DecryptFail)))?
         }
     };
+
     Ok(plaintext)
 }
 
@@ -172,6 +208,29 @@ mod tests {
 
         let nonce = GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
         cipher.decrypt(&nonce, ciphertext[0..len-nonce_size].as_ref()).unwrap()
+    }
+
+    #[test]
+    fn encrypt_decrypt_simple() {
+        let key = [1; 16].to_vec();
+        let nonce:[u8; 12] = [0; 12];
+        let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_ref()));
+        let contents = b"plaintext message".to_vec();
+
+        let mut hmac = generate_hmac(&contents, &key).unwrap();
+        println!("{:?}", hmac);
+
+        let mut ciphertext = cipher.encrypt(GenericArray::from_slice(&nonce), contents.as_slice().as_ref()).unwrap();
+        ciphertext.append(&mut nonce.to_vec());
+        ciphertext.append(&mut hmac);
+
+        let hmac: Vec<u8> = ciphertext.drain(ciphertext.len()-HMAC_SIZE..).collect();
+        let nonce: Vec<u8> = ciphertext.drain(ciphertext.len()-NONCE_SIZE..).collect();
+        let nonce = GenericArray::from_slice(nonce.as_ref());
+        let plaintext = cipher.decrypt(&nonce, ciphertext.as_slice().as_ref()).unwrap();
+
+        verify_hmac(&plaintext, &key, hmac).unwrap();
+        assert_eq!(plaintext, contents)
     }
 
     #[test]
@@ -216,14 +275,8 @@ mod tests {
         run(opt, &encrypt_cb).unwrap();
 
         // Decrypt 
-        let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_ref()));
-        let ciphertext = fs::read("test").unwrap();
-
-        let len = ciphertext.len();
-        let nonce_size = 12;
-
-        let nonce = GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
-        let plaintext = cipher.decrypt(nonce, ciphertext[0..len-nonce_size].as_ref()).unwrap();
+        let mut ciphertext = fs::read("test").unwrap();
+        let plaintext = decrypt_cb(&mut ciphertext, &key).unwrap();
 
         fs::remove_file("test").unwrap();
         fs::remove_file("test_key").unwrap();
@@ -243,10 +296,11 @@ mod tests {
         println!("{}", key.len());
         let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_ref()));
         let nonce = generate_nonce();
-        let mut ciphertext = cipher.encrypt(&nonce, key.as_ref()).unwrap();
 
+        let mut ciphertext = cipher.encrypt(&nonce, key.as_ref()).unwrap();
         ciphertext.append(&mut nonce.to_vec());
-        
+        ciphertext.append(&mut generate_hmac(&ciphertext, &key).unwrap());
+
         file.write_all(ciphertext.as_slice()).unwrap();
 
         // Decrypt 
@@ -274,19 +328,13 @@ mod tests {
         let opt = Opt{encrypt: true, decrypt: false, infile: PathBuf::from("test_not_exists"), key: Option::None, aesgcm256: false};
         run(opt, &encrypt_cb).unwrap();
 
-        let result = fs::read("test_not_exists").unwrap();
+        let mut result = fs::read("test_not_exists").unwrap();
 
         // Decrypt 
         let key_data = fs::read("key").unwrap();
         println!("{}", key_data.len());
-        let key = GenericArray::from_slice(&key_data);
-        let cipher = Aes128Gcm::new(&key);
 
-        let len = result.len();
-        let nonce_size = 12;
-
-        let nonce = GenericArray::from_slice(&result[len-nonce_size..len]);
-        let plaintext = cipher.decrypt(nonce, result[0..len-nonce_size].as_ref()).unwrap();
+        let plaintext = decrypt_cb(&mut result, &key_data).unwrap();
 
         fs::remove_file("test_not_exists").unwrap();
         fs::remove_file("key").unwrap();
@@ -322,18 +370,12 @@ mod tests {
         let opt = Opt{encrypt: true, decrypt: false, infile: PathBuf::from("testdir/"), key: Some(PathBuf::from(key_filename)), aesgcm256: false};
         run(opt, &encrypt_cb).unwrap();
 
-        let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_ref()));
         // Decrypt 
         for i in 0..5 {
             for j in 0..3 {
                 let fp = format!("testdir/{}/{}/file", i.to_string(), j.to_string());
-                let ciphertext = fs::read(fp).unwrap();
-
-                let len = ciphertext.len();
-                let nonce_size = 12;
-
-                let nonce = GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
-                let plaintext = cipher.decrypt(nonce, ciphertext[0..len-nonce_size].as_ref()).unwrap();
+                let mut ciphertext = fs::read(fp).unwrap();
+                let plaintext = decrypt_cb(&mut ciphertext, &key).unwrap();
 
                 assert_eq!(key.to_vec(), plaintext);
             }
