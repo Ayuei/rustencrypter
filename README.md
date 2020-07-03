@@ -38,7 +38,7 @@ You can chain multiple encryptions and decryptions symmetrically for added secur
 ## TODOs
 - [ ] Release compiled binaries for all platforms
 - [ ] Add an optional flag for an output file
-- [ ] Add authentication for tamper detection (signatures)
+- [x] Add authentication for tamper detection (HMAC)
 - [ ] Add support for embedded encryption and decryption chaining
 - [x] Refactor for speed using callbacks
 - [x] Fix some race conditions in the test cases
