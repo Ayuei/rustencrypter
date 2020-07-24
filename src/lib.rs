@@ -165,7 +165,7 @@ pub fn encrypt_cb(contents: &mut Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<
 
     ciphertext.append(&mut nonce.to_vec());
     ciphertext.append(&mut generate_hmac(&ciphertext, &key)?);
-    println!("{:?}", ciphertext[ciphertext.len()-HMAC_SIZE..ciphertext.len()].to_vec());
+    // println!("{:?}", ciphertext[ciphertext.len()-HMAC_SIZE..ciphertext.len()].to_vec());
     Ok(ciphertext)
 }
 
