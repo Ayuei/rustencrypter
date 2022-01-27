@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 structopt = { version = "0.3", default-features = false }
 rand = {version = "0.7.3"}
-aes-gcm = {version = "0.6.0"}
+aes-gcm = {version = "0.9.4"}
 tempfile = "3"
 auto_enums = "0.7.5"
 walkdir = "2"
