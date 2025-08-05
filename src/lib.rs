@@ -1,387 +1,605 @@
-use std::fs;
-use std::fmt;
-use std::env;
-use std::error;
-use std::io::prelude::*;
-use std::path::{PathBuf, Path};
-use rand::prelude::*;
-use aes_gcm::{Aes128Gcm, Aes256Gcm};
-use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
-use aes_gcm::aead::generic_array::typenum::consts::U12;
-use structopt::{StructOpt, clap::ArgGroup};
+use aes_gcm::aead::consts::U5;
+use aes_gcm::aead::stream::{NewStream, StreamPrimitive};
+use aes_gcm::aes::cipher::ArrayLength;
+use aes_gcm::{AeadCore, AeadInPlace, Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
+use clap::{Parser, Subcommand};
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
+use rand::{rngs::OsRng, RngCore};
+use rayon::prelude::*;
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Write};
+use std::ops::Sub;
+use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
+use thiserror::Error;
 use walkdir::WalkDir;
-use hmac::{Hmac, Mac, NewMac};
-use blake2::Blake2b;
 
-const NONCE_SIZE: usize = 12;
-const HMAC_SIZE: usize = 64;
+const AES_128_KEY_SIZE: usize = 16;
+const AES_256_KEY_SIZE: usize = 32;
+const NONCE_SIZE: usize = 7; // 96-bits is used for AES-GCM
+const AES_TAG_SIZE: usize = 16; // 128 bit is used for authentication tag
+const BUFFER_SIZE: usize = 8192; // 8KB buffer
+const BLOCK_SIZE: usize = BUFFER_SIZE + AES_TAG_SIZE;
 
-// Parse arguments for the CLI
-#[derive(StructOpt, Debug)]
-#[structopt(group = ArgGroup::with_name("action").required(true))]
-pub struct Opt {
-    #[structopt(short, long, group = "action", help = "Encrypt a file or directory")]
-    pub encrypt: bool,
-
-    #[structopt(short, long, group = "action", help = "Decrypt an encrypted file or directory")]
-    pub decrypt: bool,
-
-    #[structopt(short, long, parse(from_os_str))]
-    key: Option<PathBuf>,
-
-    #[structopt(short, long, help = "Use AES-GCM 256 bit encryption instead")]
-    aesgcm256: bool,
-
-    #[structopt(name = "input file or directory", parse(from_os_str))]
-    pub infile: PathBuf,
+#[derive(Error, Debug)]
+pub enum AppError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("Cryptography error, data has likely been tampered with!")]
+    Crypto(#[from] aes_gcm::Error),
+    #[error("Invalid key length: expected {expected}, got {actual}. Did you mix up your AES-256 and AES-128 keys?")]
+    InvalidKeyLength { expected: usize, actual: usize },
+    #[error("Could not persist temporary file: {0}")]
+    CouldNotPersist(#[from] tempfile::PersistError),
+    #[error("Could not recursively parse directories: {0}")]
+    WalkDir(#[from] walkdir::Error),
+    #[error("Template error for progress bar: {0}")]
+    TemplateError(#[from] indicatif::style::TemplateError),
+    #[error("Temporary file cannot be created due to:{0}")]
+    TempFileError(#[from] io::IntoInnerError<BufWriter<NamedTempFile>>),
 }
 
-// Creating our custom Error as aes_gcm doesn't implement std:Error
-#[derive(Debug, Clone)]
-enum CryptoError {
-    EncryptFail,
-    DecryptFail,
+// Result alias for convenience
+type Result<T> = std::result::Result<T, AppError>;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+
+    #[arg(
+        short,
+        long,
+        global = true,
+        value_name = "FILE",
+        help = "Path to the encryption key file. If not provided, defaults to './key'"
+    )]
+    pub key: Option<PathBuf>,
+
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "Use 256-bit AES-GCM instead of 128-bit"
+    )]
+    pub aes256: bool,
 }
 
-impl fmt::Display for CryptoError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            CryptoError::EncryptFail => write!(f, "Encryption Failed"),
-            // This is a wrapper, so defer to the underlying types' implementation of `fmt`.
-            CryptoError::DecryptFail => write!(f, "Decryption Failed"),
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Encrypt a file or directory
+    Encrypt {
+        #[arg(help = "Input file or directory to process")]
+        path: PathBuf,
+    },
+    /// Decrypt a file or directory
+    Decrypt {
+        #[arg(help = "Input file or directory to process")]
+        path: PathBuf,
+    },
+}
+
+impl Command {
+    fn get_path(&self) -> &PathBuf {
+        match self {
+            Command::Encrypt { path } => path,
+            Command::Decrypt { path } => path,
         }
     }
 }
 
-impl error::Error for CryptoError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        None
-    }
-}
-
-type Hash = Blake2b;
-type HmacBlake2 = Hmac<Hash>;
-
-/// Generate HMAC for message authentication and tamper detection
-pub fn generate_hmac(msg: &Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>>{
-    let mut mac = HmacBlake2::new_varkey(key)?;
-    mac.update(msg);
-
-    Ok(mac.finalize().into_bytes().to_vec())
-}
-
-pub fn verify_hmac(msg: &Vec<u8>, key: &Vec<u8>, tag: Vec<u8>) -> Result<(), Box<dyn error::Error>>{
-    let mut mac = HmacBlake2::new_varkey(key)?;
-    mac.update(&msg);
-
-    // Strip and return the HMAC tag
-    mac.verify(tag.as_slice())?;
-
-    Ok(())
-}
-
-/// Generate a fresh key with a CSPRNG
-/// We can determine key length be specified boolean
-pub fn generate_key(key256: bool) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
-    let mut key: Vec<u8> = {
-        if key256 {
-            vec![0; 32]
-        } else {
-            vec![0; 16]
-        }
-    };
-
-    rng.fill_bytes(&mut key);
+/// Generates a cryptographically secure random key.
+fn generate_key(size: usize) -> Vec<u8> {
+    let mut key = vec![0u8; size];
+    OsRng.fill_bytes(&mut key);
     key
 }
 
-/// Generate a fresh nonce for every encryption from CSPRNG
-pub fn generate_nonce() -> GenericArray<u8, U12> {
-    let mut rng = rand::thread_rng();
-    let mut nonce = [0; NONCE_SIZE];
-    rng.fill_bytes(&mut nonce);
-    *GenericArray::from_slice(&nonce) // 96-bits; unique per message
-}
-
-/// Generate a key to given file if it doesn't exist
-pub fn check_key_file(file: &PathBuf, key256: bool) -> Vec<u8> {
-    if Path::new(&file).exists() {
-        // Load old key
-        fs::read(file).unwrap()
+/// Reads a key from a file, or creates one if it doesn't exist.
+fn get_or_create_key(key_path: &Path, key_size: usize) -> Result<Vec<u8>> {
+    if key_path.exists() {
+        let key = std::fs::read(key_path)?;
+        if key.len() != key_size {
+            return Err(AppError::InvalidKeyLength {
+                expected: key_size,
+                actual: key.len(),
+            });
+        }
+        Ok(key)
     } else {
-        // Create a new key
-        let mut file = fs::File::create(&file).unwrap();
-        let key = generate_key(key256);
-        file.write_all(key.to_vec().as_slice()).unwrap();
-        key
+        println!(
+            "Key file not found. Generating new key at: {}",
+            key_path.display()
+        );
+        let key = generate_key(key_size);
+        std::fs::write(key_path, &key)?;
+        Ok(key)
     }
 }
 
+// Encrypts stream using AES streaming encryption, uses BUFFER_SIZE to encrypt plaintext + includes authentication tag 128 bits
+fn encrypt_stream<A>(cipher: A, source: &mut impl Read, dest: &mut impl Write) -> Result<()>
+where
+    A: AeadInPlace,
+    A::NonceSize: Sub<U5>,
+    <<A as AeadCore>::NonceSize as Sub<U5>>::Output: ArrayLength<u8>,
+{
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    dest.write_all(&nonce_bytes)?;
 
-// TODO decouple OPT dependency from the function and simply parse it from main
-/// Run an encryption or decryption task from main function
-pub fn run(
-    opts: Opt, 
-    cb: &dyn Fn(&mut Vec<u8>, &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> 
-) -> Result<(), Box<dyn error::Error>> {
+    let nonce = Nonce::from_slice(&nonce_bytes[..]);
 
-    let key = match opts.key {
-        // Key path is supplied, check if it exists, if not, create it
-        Some(key_file) => check_key_file(&key_file, opts.aesgcm256),
-        None => {
-            // Key path not supplied, default to CWD
-            let mut cwd = env::current_dir()?;
-            cwd.push("key");
-            check_key_file(&cwd, opts.aesgcm256)
+    let mut position = 0;
+
+    let mut buffer = [0u8; BUFFER_SIZE];
+    let encryptor = aes_gcm::aead::stream::StreamBE32::from_aead(cipher, nonce);
+
+    loop {
+        let bytes_read = source.read(&mut buffer)?;
+
+        let block = &buffer[..bytes_read];
+        if bytes_read < BUFFER_SIZE {
+            // This is the last block
+            let ciphertext = encryptor.encrypt(position, true, block)?;
+            dest.write_all(&ciphertext)?;
+            break;
+        } else {
+            // This is a full block, might not be the last
+            let ciphertext = encryptor.encrypt(position, false, block)?;
+            dest.write_all(&ciphertext)?;
         }
-    };
 
-    if opts.infile.is_dir(){
-        // Walk through directories for any files
-        for entry in WalkDir::new(&opts.infile).into_iter().filter_map(|e| e.ok()).filter(|e| e.path().is_file()) {
-            println!("Consuming {}", entry.path().display()); // alert user what we're doing (loading bar may be more appropriate)
-            fs::write(entry.path(), cb(&mut fs::read(entry.path())?, &key)?)?
-        }
-    } else {
-        fs::write(&opts.infile, cb(&mut fs::read(&opts.infile)?, &key)?)?
-    };
+        position += 1;
+    }
 
     Ok(())
 }
 
-/// Encryption callback
-pub fn encrypt_cb(contents: &mut Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> {
-    let nonce = generate_nonce();
-    let mut ciphertext = {
-        if key.len() == 32 {
-            let cipher = Aes256Gcm::new(GenericArray::from_slice(key.as_slice()));
-            cipher.encrypt(&nonce, contents.as_ref()).or(Err(Box::new(CryptoError::EncryptFail)))?
-        } else {
-            let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_slice()));
-            cipher.encrypt(&nonce, contents.as_ref()).or(Err(Box::new(CryptoError::EncryptFail)))?
-        }
-    };
+// Decrypts stream using AES streaming encryption, uses BLOCK_SIZE to decrypt cyphertext + authentication tag
+fn decrypt_stream<A>(cipher: A, source: &mut impl Read, dest: &mut impl Write) -> Result<()>
+where
+    A: AeadInPlace,
+    A::NonceSize: Sub<U5>,
+    <<A as AeadCore>::NonceSize as Sub<U5>>::Output: ArrayLength<u8>,
+{
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    source.read_exact(&mut nonce_bytes)?;
+    let nonce = Nonce::from_slice(&nonce_bytes[..]);
 
-    ciphertext.append(&mut nonce.to_vec());
-    ciphertext.append(&mut generate_hmac(&ciphertext, &key)?);
-    // println!("{:?}", ciphertext[ciphertext.len()-HMAC_SIZE..ciphertext.len()].to_vec());
-    Ok(ciphertext)
+    let mut position = 0;
+
+    // Tag size is U16
+    let mut buffer = [0u8; BLOCK_SIZE];
+    let encryptor = aes_gcm::aead::stream::StreamBE32::from_aead(cipher, nonce);
+
+    loop {
+        let bytes_read = source.read(&mut buffer)?;
+
+        let block = &buffer[..bytes_read];
+        if bytes_read < BLOCK_SIZE {
+            // This is the last block
+            let ciphertext = encryptor.decrypt(position, true, block)?;
+            dest.write_all(&ciphertext)?;
+            break;
+        } else {
+            // This is a full block, might not be the last
+            let ciphertext = encryptor.decrypt(position, false, block)?;
+            dest.write_all(&ciphertext)?;
+        }
+
+        position += 1;
+    }
+
+    Ok(())
 }
 
-/// Decryption callback
-pub fn decrypt_cb(contents: &mut Vec<u8>, key: &Vec<u8>) -> Result<Vec<u8>, Box<dyn error::Error>> {
-    let hmac: Vec<u8> = contents.drain(contents.len()-HMAC_SIZE..).collect();
-
-    // Verify that the message is authentic before we do anything else
-    verify_hmac(&contents, &key, hmac)?;
-
-    let drain: Vec<u8> = contents.drain(contents.len()-NONCE_SIZE..).collect();
-    let nonce = GenericArray::from_slice(drain.as_slice());
-
-    let plaintext = {
-        if key.len() == 32 {
-            let cipher = Aes256Gcm::new(GenericArray::from_slice(key.as_slice()));
-            cipher.decrypt(nonce, contents.as_ref()).or(Err(Box::new(CryptoError::DecryptFail)))?
-        } else {
-            let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_slice()));
-            cipher.decrypt(nonce, contents.as_ref()).or(Err(Box::new(CryptoError::DecryptFail)))?
+// Encrypt or decrypt stream from reader
+fn process_stream(
+    command: Command,
+    source: &mut impl Read,
+    dest: &mut impl Write,
+    key: &[u8],
+    aes256: bool,
+) -> Result<()> {
+    match command {
+        Command::Encrypt { path: _ } => {
+            if aes256 {
+                let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+                encrypt_stream(cipher, source, dest)
+            } else {
+                let cipher = Aes128Gcm::new_from_slice(key).unwrap();
+                encrypt_stream(cipher, source, dest)
+            }
         }
+        Command::Decrypt { path: _ } => {
+            if aes256 {
+                let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+                decrypt_stream(cipher, source, dest)
+            } else {
+                let cipher = Aes128Gcm::new_from_slice(key).unwrap();
+                decrypt_stream(cipher, source, dest)
+            }
+        }
+    }
+}
+
+/// Processes a single file: encrypts or decrypts it safely using a temporary file.
+fn process_file(path: &Path, command: Command, key: &[u8], aes256: bool) -> Result<()> {
+    let mut source_file = File::open(path)?;
+
+    let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file = BufWriter::new(NamedTempFile::new_in(parent_dir)?);
+
+    let result = process_stream(command, &mut source_file, &mut temp_file, key, aes256);
+
+    if result.is_ok() {
+        temp_file.into_inner()?.persist(path)?;
+    }
+
+    result
+}
+
+/// Main entry point for the application logic.
+pub fn run(cli: Cli) -> Result<()> {
+    let (key_size, default_key_name) = if cli.aes256 {
+        println!("Big Key");
+        (AES_256_KEY_SIZE, "secret_key_256")
+    } else {
+        (AES_128_KEY_SIZE, "secret_key_128")
     };
 
-    Ok(plaintext)
+    // Determine the default key path in an OS-independent way.
+    let default_key_path = || {
+        // dirs::data_dir() returns the conventional location for app data.
+        // Linux:   ~/.local/share
+        // macOS:   ~/Library/Application Support
+        // Windows: C:\Users\<user>\AppData\Roaming
+        dirs::data_dir()
+            .map(|mut path| {
+                // It's crucial to create a subdirectory for your application
+                // to avoid polluting the user's data directory.
+                path.push("rust_encrypter");
+
+                // Create the application's data directory if it doesn't exist.
+                // create_dir_all is idempotent, so it's safe to call every time.
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    // If we can't create the directory, we can't store the key.
+                    // We'll fall back to the local directory, but print a warning.
+                    eprintln!("Warning: Could not create data directory at {}: {}. Falling back to local 'key' file.", path.display(), e);
+                    return PathBuf::from(default_key_name);
+                }
+
+                path.push(default_key_name);
+                path
+            })
+            // If the data directory cannot be determined at all, fall back to the current directory.
+            .unwrap_or_else(|| PathBuf::from(default_key_name))
+    };
+
+    let key_path = cli.key.clone().unwrap_or_else(default_key_path);
+    let key = get_or_create_key(&key_path, key_size)?;
+
+    if cli.command.get_path().is_dir() {
+        // --- Directory Processing with Progress Bar ---
+        let entries: Vec<_> = WalkDir::new(&cli.command.get_path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .collect();
+
+        let bar = ProgressBar::new(entries.len() as u64);
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+                )?
+                .progress_chars("#>-"),
+        );
+
+        println!("Processing {} files...", entries.len());
+        entries
+            .par_iter()
+            .progress_with(bar) // Wrap the iterator with a progress bar
+            .for_each(|entry| {
+                if let Err(e) = process_file(entry.path(), cli.command.clone(), &key, cli.aes256) {
+                    // Using eprintln to avoid interfering with progress bar rendering
+                    eprintln!("\nFailed to process {}: {}", entry.path().display(), e);
+                }
+            });
+    } else if cli.command.get_path().is_file() {
+        // --- Single File Processing with Progress Bar ---
+        let file_size = std::fs::metadata(cli.command.get_path())?.len();
+        let progress = ProgressBar::new(file_size);
+        progress.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+            .progress_chars("#>-"));
+
+        println!("Processing: {}", cli.command.get_path().display());
+
+        let source_file = File::open(&cli.command.get_path())?;
+        // Wrap the file reader with the progress bar
+        let mut reader = progress.wrap_read(source_file);
+
+        let parent_dir = cli
+            .command
+            .get_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let temp_file = NamedTempFile::new_in(parent_dir)?;
+        let mut writer = BufWriter::new(&temp_file);
+
+        let result = process_stream(
+            cli.command.clone(),
+            &mut reader,
+            &mut writer,
+            &key,
+            cli.aes256,
+        );
+
+        drop(writer);
+
+        if result.is_ok() {
+            temp_file.persist(cli.command.get_path())?;
+        } else {
+            // The temp file is automatically cleaned up on drop if there's an error.
+            return result;
+        }
+    } else {
+        return Err(AppError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Input path is not a valid file or directory",
+        )));
+    }
+
+    println!("\nOperation completed successfully.");
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use std::io::Cursor;
 
-    fn encrypt_decrypt(key: &Vec<u8>, nonce: GenericArray<u8, U12>) -> Vec<u8> {
-        let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_ref()));
-        let contents = b"plaintext message";
-
-        let mut ciphertext = cipher.encrypt(&nonce, contents.as_ref()).unwrap();
-        ciphertext.append(&mut nonce.to_vec());
-        let len = ciphertext.len();
-        let nonce_size = nonce.len();
-
-        let nonce = GenericArray::from_slice(&ciphertext[len-nonce_size..len]);
-        cipher.decrypt(&nonce, ciphertext[0..len-nonce_size].as_ref()).unwrap()
-    }
-
-    #[test]
-    fn encrypt_decrypt_simple() {
-        let key = [1; 16].to_vec();
-        let nonce:[u8; 12] = [0; 12];
-        let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_ref()));
-        let contents = b"plaintext message".to_vec();
-
-        let mut hmac = generate_hmac(&contents, &key).unwrap();
-        println!("{:?}", hmac);
-
-        let mut ciphertext = cipher.encrypt(GenericArray::from_slice(&nonce), contents.as_slice().as_ref()).unwrap();
-        ciphertext.append(&mut nonce.to_vec());
-        ciphertext.append(&mut hmac);
-
-        let hmac: Vec<u8> = ciphertext.drain(ciphertext.len()-HMAC_SIZE..).collect();
-        let nonce: Vec<u8> = ciphertext.drain(ciphertext.len()-NONCE_SIZE..).collect();
-        let nonce = GenericArray::from_slice(nonce.as_ref());
-        let plaintext = cipher.decrypt(&nonce, ciphertext.as_slice().as_ref()).unwrap();
-
-        verify_hmac(&plaintext, &key, hmac).unwrap();
-        assert_eq!(plaintext, contents)
-    }
-
-    #[test]
-    fn check_key_gen() {
-        let key = generate_key(false);
-        let nonce = *GenericArray::from_slice(&[0; 12]);
-
-        assert_eq!(encrypt_decrypt(&key, nonce), b"plaintext message");
-    }
-
-    #[test]
-    fn check_nonce_gen() {
-        let key = vec![0; 16];
-        let nonce = generate_nonce();
-
-        assert_eq!(encrypt_decrypt(&key, nonce), b"plaintext message");
-    }
-
-    #[test]
-    fn check_key_file_exists() {
-        let mut file = NamedTempFile::new().unwrap(); 
-        let key = generate_key(false);
-        file.write_all(key.to_vec().as_slice()).unwrap();
-
-        let out_key = check_key_file(&file.path().into(), false);
-
-        assert_eq!(key, out_key)
-    }
-
-    #[test]
-    fn check_run_encrypt() {
-        let mut file = fs::File::create("test").unwrap(); 
-        let mut key_file = fs::File::create("test_key").unwrap(); 
-
-        // Write random stuff to file
-        let key = generate_key(false);
-        file.write_all(key.to_vec().as_slice()).unwrap();
-        key_file.write_all(key.to_vec().as_slice()).unwrap();
-
-        // Encrypt
-        let opt = Opt{encrypt: true, decrypt: false, infile: PathBuf::from("test"), key: Some(PathBuf::from("test_key")), aesgcm256: false};
-        run(opt, &encrypt_cb).unwrap();
-
-        // Decrypt 
-        let mut ciphertext = fs::read("test").unwrap();
-        let plaintext = decrypt_cb(&mut ciphertext, &key).unwrap();
-
-        fs::remove_file("test").unwrap();
-        fs::remove_file("test_key").unwrap();
-
-        assert_eq!(key.to_vec(), plaintext);
-    }
-    #[test]
-    fn check_run_decrypt() {
-        let mut file = fs::File::create("test_decrypt").unwrap(); 
-        let mut key_file = fs::File::create("test_key_decrypt").unwrap(); 
-
-        // Generate key file 
-        let key = generate_key(false);
-        key_file.write_all(key.to_vec().as_slice()).unwrap();
-
-        // Encrypt 
-        println!("{}", key.len());
-        let cipher = Aes128Gcm::new(GenericArray::from_slice(key.as_ref()));
-        let nonce = generate_nonce();
-
-        let mut ciphertext = cipher.encrypt(&nonce, key.as_ref()).unwrap();
-        ciphertext.append(&mut nonce.to_vec());
-        ciphertext.append(&mut generate_hmac(&ciphertext, &key).unwrap());
-
-        file.write_all(ciphertext.as_slice()).unwrap();
-
-        // Decrypt 
-        let opt = Opt{encrypt: false, decrypt: true, infile: PathBuf::from("test_decrypt"), key: Some(PathBuf::from("test_key_decrypt")), aesgcm256: false};
-        run(opt, &decrypt_cb).unwrap();
-
-        let result = fs::read("test_decrypt").unwrap();
-
-        fs::remove_file("test_decrypt").unwrap();
-        fs::remove_file("test_key_decrypt").unwrap();
-
-        assert_eq!(key.to_vec(), result);
-    }
-
-    #[test]
-    fn check_run_key_file_not_exists() {
-        let mut file = fs::File::create("test_not_exists").unwrap(); 
-
-        // Write random stuff to file
-        let rand_msg = generate_key(false);
-        file.write_all(rand_msg.to_vec().as_slice()).unwrap();
-        file.flush().unwrap();
-
-        // Encrypt
-        let opt = Opt{encrypt: true, decrypt: false, infile: PathBuf::from("test_not_exists"), key: Option::None, aesgcm256: false};
-        run(opt, &encrypt_cb).unwrap();
-
-        let mut result = fs::read("test_not_exists").unwrap();
-
-        // Decrypt 
-        let key_data = fs::read("key").unwrap();
-        println!("{}", key_data.len());
-
-        let plaintext = decrypt_cb(&mut result, &key_data).unwrap();
-
-        fs::remove_file("test_not_exists").unwrap();
-        fs::remove_file("key").unwrap();
-
-        assert_eq!(rand_msg.to_vec(), plaintext);
-    }
-    
-    #[test]
-    #[should_panic]
-    fn check_run_infile_not_exists() {
-        // Encrypt
-        let opt = Opt{encrypt: true, decrypt: false, infile: PathBuf::from("file_does_not_exist"), key: Option::None, aesgcm256: false};
-        let _result = run(opt, &encrypt_cb).unwrap();
-    }
-
-    #[test]
-    fn check_run_encrypt_decrypt_directory() {
-        let key_filename = "test_key_directory";
-        let mut key_file = fs::File::create(key_filename).unwrap(); 
-        let key = generate_key(false);
-        key_file.write_all(key.to_vec().as_slice()).unwrap();
-
-        for i in 0..5 {
-            for j in 0..3 {
-                let mut fp = format!("testdir/{}/{}/", i.to_string(), j.to_string());
-                fs::create_dir_all(&fp).unwrap();
-                fp.push_str("file");
-                fs::write(&fp, key.to_vec().as_slice()).unwrap();
-            }
+    fn test_key(aes256: bool) -> Vec<u8> {
+        let size = if aes256 {
+            AES_256_KEY_SIZE
+        } else {
+            AES_128_KEY_SIZE
         };
+        vec![42; size]
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_stream_aes128() {
+        let key = test_key(false);
+        let plaintext = b"this is a moderately long test message for streaming encryption.";
+
+        let mut source = Cursor::new(plaintext);
+        let mut encrypted_dest = Cursor::new(Vec::new());
+
+        process_stream(
+            Command::Encrypt {
+                path: PathBuf::new(),
+            },
+            &mut source,
+            &mut encrypted_dest,
+            &key,
+            false,
+        )
+        .unwrap();
+
+        let mut encrypted_source = Cursor::new(encrypted_dest.into_inner());
+        let mut decrypted_dest = Cursor::new(Vec::new());
+
+        process_stream(
+            Command::Decrypt {
+                path: PathBuf::new(),
+            },
+            &mut encrypted_source,
+            &mut decrypted_dest,
+            &key,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plaintext.to_vec(), decrypted_dest.into_inner());
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_stream_aes256() {
+        let key = test_key(true);
+        let plaintext =
+            b"this is a moderately long test message for streaming encryption with AES256.";
+        let mut source = Cursor::new(plaintext);
+        let mut encrypted_dest = Cursor::new(Vec::new());
+
+        process_stream(
+            Command::Encrypt {
+                path: PathBuf::new(),
+            },
+            &mut source,
+            &mut encrypted_dest,
+            &key,
+            true,
+        )
+        .unwrap();
+
+        let mut encrypted_source = Cursor::new(encrypted_dest.into_inner());
+        let mut decrypted_dest = Cursor::new(Vec::new());
+
+        process_stream(
+            Command::Decrypt {
+                path: PathBuf::new(),
+            },
+            &mut encrypted_source,
+            &mut decrypted_dest,
+            &key,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plaintext.to_vec(), decrypted_dest.into_inner());
+    }
+
+    #[test]
+    fn test_decryption_failure_on_tampered_data() {
+        let key = test_key(false);
+        let plaintext = b"do not tamper with this data";
+        let mut source = Cursor::new(plaintext);
+        let mut encrypted_dest = Cursor::new(Vec::new());
+
+        process_stream(
+            Command::Encrypt {
+                path: PathBuf::new(),
+            },
+            &mut source,
+            &mut encrypted_dest,
+            &key,
+            false,
+        )
+        .unwrap();
+        let mut tampered_data = encrypted_dest.into_inner();
+
+        // Tamper with the last byte of the ciphertext
+        let last_byte_index = tampered_data.len() - 1;
+        tampered_data[last_byte_index] = tampered_data[last_byte_index].wrapping_add(1);
+
+        let mut tampered_source = Cursor::new(tampered_data);
+        let mut decrypted_dest = Cursor::new(Vec::new());
+
+        // Decryption should fail
+        let result = process_stream(
+            Command::Decrypt {
+                path: PathBuf::new(),
+            },
+            &mut tampered_source,
+            &mut decrypted_dest,
+            &key,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), AppError::Crypto(_)));
+    }
+
+    #[test]
+    fn test_get_or_create_key_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("test.key");
+        let key_size = AES_128_KEY_SIZE;
+
+        // 1. Key doesn't exist, should be created
+        let key1 = get_or_create_key(&key_path, key_size).unwrap();
+        assert_eq!(key1.len(), key_size);
+        assert!(key_path.exists());
+
+        // 2. Key exists, should be read
+        let key2 = get_or_create_key(&key_path, key_size).unwrap();
+        assert_eq!(key1, key2);
+
+        // 3. Invalid key length
+        std::fs::write(&key_path, vec![0; 10]).unwrap();
+        let result = get_or_create_key(&key_path, key_size);
+        assert!(matches!(
+            result.unwrap_err(),
+            AppError::InvalidKeyLength {
+                expected: 16,
+                actual: 10
+            }
+        ));
+    }
+
+    const LARGE_FILE_SIZE: usize = 500 * 1024 * 1024; // 500 MB
+
+    #[test]
+    #[ignore] // This test is slow, run with `cargo test -- --ignored`
+    fn test_large_file_encrypt_decrypt_aes128() {
+        println!("Running 100MB AES-128 stream test (this may take a moment)...");
+        let key = test_key(false);
+        // Create a large vector of repeating bytes to simulate a large file
+        let plaintext = vec![42u8; LARGE_FILE_SIZE];
+        let mut source = Cursor::new(&plaintext);
+        let mut encrypted_dest = Cursor::new(Vec::new());
 
         // Encrypt
-        let opt = Opt{encrypt: true, decrypt: false, infile: PathBuf::from("testdir/"), key: Some(PathBuf::from(key_filename)), aesgcm256: false};
-        run(opt, &encrypt_cb).unwrap();
+        process_stream(
+            Command::Encrypt {
+                path: PathBuf::new(),
+            },
+            &mut source,
+            &mut encrypted_dest,
+            &key,
+            false,
+        )
+        .unwrap();
+        let encrypted_data = encrypted_dest.into_inner();
 
-        // Decrypt 
-        for i in 0..5 {
-            for j in 0..3 {
-                let fp = format!("testdir/{}/{}/file", i.to_string(), j.to_string());
-                let mut ciphertext = fs::read(fp).unwrap();
-                let plaintext = decrypt_cb(&mut ciphertext, &key).unwrap();
+        // Ensure ciphertext is not the same as plaintext and has nonce + tag overhead
+        assert_ne!(plaintext.len(), encrypted_data.len());
+        assert_ne!(plaintext, encrypted_data);
 
-                assert_eq!(key.to_vec(), plaintext);
-            }
-        };
+        // Decrypt
+        let mut encrypted_source = Cursor::new(encrypted_data);
+        let mut decrypted_dest = Cursor::new(Vec::new());
+        process_stream(
+            Command::Decrypt {
+                path: PathBuf::new(),
+            },
+            &mut encrypted_source,
+            &mut decrypted_dest,
+            &key,
+            false,
+        )
+        .unwrap();
 
-        fs::remove_file(key_filename).unwrap();
-        fs::remove_dir_all("testdir/").unwrap();
+        // Assert that the decrypted data is identical to the original plaintext
+        assert_eq!(plaintext, decrypted_dest.into_inner());
+    }
+
+    #[test]
+    #[ignore] // This test is slow, run with `cargo test -- --ignored`
+    fn test_large_file_encrypt_decrypt_aes256() {
+        println!("Running 100MB AES-256 stream test (this may take a moment)...");
+        let key = test_key(true);
+
+        // Create a large vector of repeating bytes to simulate a large file
+        let plaintext = vec![88u8; LARGE_FILE_SIZE];
+        let mut source = Cursor::new(&plaintext);
+        let mut encrypted_dest = Cursor::new(Vec::new());
+
+        // Encrypt
+        process_stream(
+            Command::Encrypt {
+                path: PathBuf::new(),
+            },
+            &mut source,
+            &mut encrypted_dest,
+            &key,
+            true,
+        )
+        .unwrap();
+        let encrypted_data = encrypted_dest.into_inner();
+
+        // Ensure ciphertext is not the same as plaintext and has nonce + tag overhead
+        assert_ne!(plaintext.len(), encrypted_data.len());
+        assert_ne!(plaintext, encrypted_data);
+
+        // Decrypt
+        let mut encrypted_source = Cursor::new(encrypted_data);
+        let mut decrypted_dest = Cursor::new(Vec::new());
+        process_stream(
+            Command::Decrypt {
+                path: PathBuf::new(),
+            },
+            &mut encrypted_source,
+            &mut decrypted_dest,
+            &key,
+            true,
+        )
+        .unwrap();
+
+        // Assert that the decrypted data is identical to the original plaintext
+        assert_eq!(plaintext, decrypted_dest.into_inner());
     }
 }
