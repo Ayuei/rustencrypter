@@ -4,7 +4,8 @@ use aes_gcm::aes::cipher::ArrayLength;
 use aes_gcm::{AeadCore, AeadInPlace, Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use clap::{Parser, Subcommand};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
-use rand::{rngs::OsRng, RngCore};
+use rand::rngs::OsRng;
+use rand::TryRngCore;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
@@ -18,8 +19,8 @@ const AES_128_KEY_SIZE: usize = 16;
 const AES_256_KEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 7; // 96-bits is used for AES-GCM
 const AES_TAG_SIZE: usize = 16; // 128 bit is used for authentication tag
-const BUFFER_SIZE: usize = 8192; // 8KB buffer
-const BLOCK_SIZE: usize = BUFFER_SIZE + AES_TAG_SIZE;
+const ENCRYPT_BUFFER_SIZE: usize = 8192; // 8KB buffer
+const DECRYPT_BLOCK_SIZE: usize = ENCRYPT_BUFFER_SIZE + AES_TAG_SIZE;
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -92,7 +93,9 @@ impl Command {
 /// Generates a cryptographically secure random key.
 fn generate_key(size: usize) -> Vec<u8> {
     let mut key = vec![0u8; size];
-    OsRng.fill_bytes(&mut key);
+    OsRng
+        .try_fill_bytes(&mut key)
+        .expect("Could not securely fill the bytes of the key. Is this a new server?");
     key
 }
 
@@ -126,21 +129,23 @@ where
     <<A as AeadCore>::NonceSize as Sub<U5>>::Output: ArrayLength<u8>,
 {
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .expect("Could not securely fill the bytes of the nonce. Is this a new server?");
     dest.write_all(&nonce_bytes)?;
 
     let nonce = Nonce::from_slice(&nonce_bytes[..]);
 
     let mut position = 0;
 
-    let mut buffer = [0u8; BUFFER_SIZE];
+    let mut buffer = [0u8; ENCRYPT_BUFFER_SIZE];
     let encryptor = aes_gcm::aead::stream::StreamBE32::from_aead(cipher, nonce);
 
     loop {
         let bytes_read = source.read(&mut buffer)?;
 
         let block = &buffer[..bytes_read];
-        if bytes_read < BUFFER_SIZE {
+        if bytes_read < ENCRYPT_BUFFER_SIZE {
             // This is the last block
             let ciphertext = encryptor.encrypt(position, true, block)?;
             dest.write_all(&ciphertext)?;
@@ -171,14 +176,14 @@ where
     let mut position = 0;
 
     // Tag size is U16
-    let mut buffer = [0u8; BLOCK_SIZE];
+    let mut buffer = [0u8; DECRYPT_BLOCK_SIZE];
     let encryptor = aes_gcm::aead::stream::StreamBE32::from_aead(cipher, nonce);
 
     loop {
         let bytes_read = source.read(&mut buffer)?;
 
         let block = &buffer[..bytes_read];
-        if bytes_read < BLOCK_SIZE {
+        if bytes_read < DECRYPT_BLOCK_SIZE {
             // This is the last block
             let ciphertext = encryptor.decrypt(position, true, block)?;
             dest.write_all(&ciphertext)?;
