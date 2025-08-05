@@ -26,7 +26,7 @@ const DECRYPT_BLOCK_SIZE: usize = ENCRYPT_BUFFER_SIZE + AES_TAG_SIZE;
 pub enum AppError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("Cryptography error, data has likely been tampered with!")]
+    #[error("Cryptography error, either the data has been tampered with or the file is not encrypted at all!")]
     Crypto(#[from] aes_gcm::Error),
     #[error("Invalid key length: expected {expected}, got {actual}. Did you mix up your AES-256 and AES-128 keys?")]
     InvalidKeyLength { expected: usize, actual: usize },
@@ -65,6 +65,15 @@ pub struct Cli {
         help = "Use 256-bit AES-GCM instead of 128-bit"
     )]
     pub aes256: bool,
+
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "Number of times to repeat encryption or decryption.",
+        default_value_t = 1
+    )]
+    pub repeat: usize,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -308,48 +317,57 @@ pub fn run(cli: Cli) -> Result<()> {
             .par_iter()
             .progress_with(bar) // Wrap the iterator with a progress bar
             .for_each(|entry| {
-                if let Err(e) = process_file(entry.path(), cli.command.clone(), &key, cli.aes256) {
-                    // Using eprintln to avoid interfering with progress bar rendering
-                    eprintln!("\nFailed to process {}: {}", entry.path().display(), e);
+                for _ in 0..cli.repeat {
+                    if let Err(e) =
+                        process_file(entry.path(), cli.command.clone(), &key, cli.aes256)
+                    {
+                        // Using eprintln to avoid interfering with progress bar rendering
+                        eprintln!("\nFailed to process {}: {}", entry.path().display(), e);
+                    }
                 }
             });
     } else if cli.command.get_path().is_file() {
-        // --- Single File Processing with Progress Bar ---
-        let file_size = std::fs::metadata(cli.command.get_path())?.len();
-        let progress = ProgressBar::new(file_size);
-        progress.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
-            .progress_chars("#>-"));
-
         println!("Processing: {}", cli.command.get_path().display());
 
-        let source_file = File::open(&cli.command.get_path())?;
-        // Wrap the file reader with the progress bar
-        let mut reader = progress.wrap_read(source_file);
+        for i in 0..cli.repeat {
+            // --- Single File Processing with Progress Bar ---
+            let file_size = std::fs::metadata(cli.command.get_path())?.len();
+            let progress = ProgressBar::new(file_size);
+            progress.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+            .progress_chars("#>-"));
+            let source_file = File::open(&cli.command.get_path())?;
 
-        let parent_dir = cli
-            .command
-            .get_path()
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        let temp_file = NamedTempFile::new_in(parent_dir)?;
-        let mut writer = BufWriter::new(&temp_file);
+            // Wrap the file reader with the progress bar
+            let mut reader = progress.wrap_read(source_file);
+            let parent_dir = cli
+                .command
+                .get_path()
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let temp_file = NamedTempFile::new_in(parent_dir)?;
+            let mut writer = BufWriter::new(&temp_file);
 
-        let result = process_stream(
-            cli.command.clone(),
-            &mut reader,
-            &mut writer,
-            &key,
-            cli.aes256,
-        );
+            if cli.repeat > 1 {
+                println!("Repeating {} out of {} times.", i + 1, cli.repeat);
+            }
 
-        drop(writer);
+            let result = process_stream(
+                cli.command.clone(),
+                &mut reader,
+                &mut writer,
+                &key,
+                cli.aes256,
+            );
 
-        if result.is_ok() {
-            temp_file.persist(cli.command.get_path())?;
-        } else {
-            // The temp file is automatically cleaned up on drop if there's an error.
-            return result;
+            drop(writer);
+
+            if result.is_ok() {
+                temp_file.persist(cli.command.get_path())?;
+            } else {
+                // The temp file is automatically cleaned up on drop if there's an error.
+                return result;
+            }
         }
     } else {
         return Err(AppError::Io(io::Error::new(
@@ -593,6 +611,7 @@ mod tests {
         // Decrypt
         let mut encrypted_source = Cursor::new(encrypted_data);
         let mut decrypted_dest = Cursor::new(Vec::new());
+
         process_stream(
             Command::Decrypt {
                 path: PathBuf::new(),
