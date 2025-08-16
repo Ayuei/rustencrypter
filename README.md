@@ -15,8 +15,7 @@ cargo install --path rustencrypter
 ## Usage
 
 ```bash
-./rustencrypter <input file> <--[e]ncrypt|--[d]ecrypt> --[k]ey <key file>
-
+./rustencrypter [encrypt/decrypt] <input file> --[k]ey <key file>
 ```
 
 **Note encryption and decryption will overwrite the source file**
