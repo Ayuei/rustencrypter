@@ -210,7 +210,7 @@ where
 }
 
 // Encrypt or decrypt stream from reader
-fn process_stream(
+pub fn process_stream(
     command: Command,
     source: &mut impl Read,
     dest: &mut impl Write,
