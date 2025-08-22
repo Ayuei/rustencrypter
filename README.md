@@ -15,12 +15,10 @@ cargo install --path rustencrypter
 ## Usage
 
 ```bash
-./rustencrypter <input file> <--[e]ncrypt|--[d]ecrypt> --[k]ey <key file>
-
+./rustencrypter [encrypt/decrypt] <input file> --[k]ey <key file> --[r]epeat [number of times]
 ```
 
-**Note encryption and decryption will overwrite the source file**
-*You can only do a single encrypt or decrypt operation per call*
+**Note encryption and decryption will (atomically) overwrite the source file**
 
 ## Features
 
@@ -36,13 +34,12 @@ or requested directory/file
 
 ## Neat things
 
-You can chain multiple encryptions and decryptions symmetrically for added security.
+You can chain multiple encryptions and decryptions symmetrically. 
+There's no practical reason for this, but it's cool.
 
 ```bash
-./rustencrypter encrypt file 
-./rustencrypter encrypt file
-./rustencrypter decrypt file
-./rustencrypter decrypt file
+./rustencrypter encrypt <input file> --repeat 5
+./rustencrypter decrypt <input file> --repeat 5
 ```
 
 ## TODOs
