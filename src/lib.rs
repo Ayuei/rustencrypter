@@ -109,7 +109,7 @@ fn generate_key(size: usize) -> Vec<u8> {
 }
 
 /// Reads a key from a file, or creates one if it doesn't exist.
-fn get_or_create_key(key_path: &Path, key_size: usize) -> Result<Vec<u8>> {
+pub fn get_or_create_key(key_path: &Path, key_size: usize) -> Result<Vec<u8>> {
     if key_path.exists() {
         let key = std::fs::read(key_path)?;
         if key.len() != key_size {
@@ -131,7 +131,7 @@ fn get_or_create_key(key_path: &Path, key_size: usize) -> Result<Vec<u8>> {
 }
 
 // Encrypts stream using AES streaming encryption, uses BUFFER_SIZE to encrypt plaintext + includes authentication tag 128 bits
-fn encrypt_stream<A>(cipher: A, source: &mut impl Read, dest: &mut impl Write) -> Result<()>
+pub fn encrypt_stream<A>(cipher: A, source: &mut impl Read, dest: &mut impl Write) -> Result<()>
 where
     A: AeadInPlace,
     A::NonceSize: Sub<U5>,
@@ -172,7 +172,7 @@ where
 }
 
 // Decrypts stream using AES streaming encryption, uses BLOCK_SIZE to decrypt cyphertext + authentication tag
-fn decrypt_stream<A>(cipher: A, source: &mut impl Read, dest: &mut impl Write) -> Result<()>
+pub fn decrypt_stream<A>(cipher: A, source: &mut impl Read, dest: &mut impl Write) -> Result<()>
 where
     A: AeadInPlace,
     A::NonceSize: Sub<U5>,
