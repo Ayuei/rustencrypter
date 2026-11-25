@@ -7,10 +7,11 @@ use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 use rayon::prelude::*;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::ops::Sub;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -38,6 +39,8 @@ pub enum AppError {
     TemplateError(#[from] indicatif::style::TemplateError),
     #[error("Temporary file cannot be created due to:{0}")]
     TempFileError(#[from] io::IntoInnerError<BufWriter<NamedTempFile>>),
+    #[error("{failed} of {total} files could not be processed (see the errors above)")]
+    FilesFailed { failed: usize, total: usize },
 }
 
 // Result alias for convenience
@@ -125,9 +128,42 @@ pub fn get_or_create_key(key_path: &Path, key_size: usize) -> Result<Vec<u8>> {
             key_path.display()
         );
         let key = generate_key(key_size);
-        std::fs::write(key_path, &key)?;
+        write_key_file(key_path, &key)?;
         Ok(key)
     }
+}
+
+/// Writes a new key file readable only by its owner (0600 on Unix), and never
+/// overwrites an existing file: if another process created one meanwhile,
+/// this fails rather than replacing a key that may already be in use.
+fn write_key_file(key_path: &Path, key: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(key_path)?;
+    file.write_all(key)?;
+    file.sync_all()
+}
+
+/// Reads until `buf` is full or the source is exhausted, and returns the
+/// number of bytes read. A single `read` may return fewer bytes than asked for
+/// before the end of the stream (pipes, sockets, network filesystems), so a
+/// short read alone does not mean the last block has been reached.
+fn read_full(source: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match source.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 // Encrypts stream using AES streaming encryption, uses BUFFER_SIZE to encrypt plaintext + includes authentication tag 128 bits
@@ -151,7 +187,7 @@ where
     let encryptor = aes_gcm::aead::stream::StreamBE32::from_aead(cipher, nonce);
 
     loop {
-        let bytes_read = source.read(&mut buffer)?;
+        let bytes_read = read_full(source, &mut buffer)?;
 
         let block = &buffer[..bytes_read];
         if bytes_read < ENCRYPT_BUFFER_SIZE {
@@ -189,7 +225,7 @@ where
     let encryptor = aes_gcm::aead::stream::StreamBE32::from_aead(cipher, nonce);
 
     loop {
-        let bytes_read = source.read(&mut buffer)?;
+        let bytes_read = read_full(source, &mut buffer)?;
 
         let block = &buffer[..bytes_read];
         if bytes_read < DECRYPT_BLOCK_SIZE {
@@ -313,6 +349,7 @@ pub fn run(cli: Cli) -> Result<()> {
         );
 
         println!("Processing {} files...", entries.len());
+        let failed = AtomicUsize::new(0);
         entries
             .par_iter()
             .progress_with(bar) // Wrap the iterator with a progress bar
@@ -323,9 +360,20 @@ pub fn run(cli: Cli) -> Result<()> {
                     {
                         // Using eprintln to avoid interfering with progress bar rendering
                         eprintln!("\nFailed to process {}: {}", entry.path().display(), e);
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        // Stop repeating on this file: its state is no longer known.
+                        break;
                     }
                 }
             });
+
+        let failed = failed.into_inner();
+        if failed > 0 {
+            return Err(AppError::FilesFailed {
+                failed,
+                total: entries.len(),
+            });
+        }
     } else if cli.command.get_path().is_file() {
         println!("Processing: {}", cli.command.get_path().display());
 
@@ -531,6 +579,147 @@ mod tests {
                 actual: 10
             }
         ));
+    }
+
+    /// A reader that returns at most `chunk` bytes per `read`, as pipes,
+    /// sockets and network filesystems may.
+    struct ShortReader<R> {
+        inner: R,
+        chunk: usize,
+    }
+
+    impl<R: Read> Read for ShortReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.chunk);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+
+    fn round_trip_with_short_reads(aes256: bool) {
+        let key = test_key(aes256);
+        // Several full blocks plus a partial one.
+        let plaintext: Vec<u8> = (0..(3 * ENCRYPT_BUFFER_SIZE + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let mut source = ShortReader {
+            inner: Cursor::new(&plaintext),
+            chunk: 1000,
+        };
+        let mut encrypted_dest = Cursor::new(Vec::new());
+        process_stream(
+            Command::Encrypt {
+                path: PathBuf::new(),
+            },
+            &mut source,
+            &mut encrypted_dest,
+            &key,
+            aes256,
+        )
+        .unwrap();
+
+        let mut encrypted_source = ShortReader {
+            inner: Cursor::new(encrypted_dest.into_inner()),
+            chunk: 1000,
+        };
+        let mut decrypted_dest = Cursor::new(Vec::new());
+        process_stream(
+            Command::Decrypt {
+                path: PathBuf::new(),
+            },
+            &mut encrypted_source,
+            &mut decrypted_dest,
+            &key,
+            aes256,
+        )
+        .unwrap();
+
+        assert_eq!(plaintext, decrypted_dest.into_inner());
+    }
+
+    #[test]
+    fn test_short_reads_round_trip_aes128() {
+        round_trip_with_short_reads(false);
+    }
+
+    #[test]
+    fn test_short_reads_round_trip_aes256() {
+        round_trip_with_short_reads(true);
+    }
+
+    #[test]
+    fn test_exact_multiple_of_block_size() {
+        let key = test_key(false);
+        let plaintext = vec![7u8; 2 * ENCRYPT_BUFFER_SIZE];
+        let mut encrypted_dest = Cursor::new(Vec::new());
+        process_stream(
+            Command::Encrypt {
+                path: PathBuf::new(),
+            },
+            &mut Cursor::new(&plaintext),
+            &mut encrypted_dest,
+            &key,
+            false,
+        )
+        .unwrap();
+        let mut decrypted_dest = Cursor::new(Vec::new());
+        process_stream(
+            Command::Decrypt {
+                path: PathBuf::new(),
+            },
+            &mut Cursor::new(encrypted_dest.into_inner()),
+            &mut decrypted_dest,
+            &key,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plaintext, decrypted_dest.into_inner());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_generated_key_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("private.key");
+        get_or_create_key(&key_path, AES_256_KEY_SIZE).unwrap();
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key file mode is {mode:o}");
+    }
+
+    #[test]
+    fn test_directory_run_fails_when_a_file_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        // Not encrypted, so decrypting it must fail.
+        std::fs::write(data_dir.join("plain.txt"), b"not encrypted").unwrap();
+
+        let cli = Cli {
+            command: Command::Decrypt {
+                path: data_dir.clone(),
+            },
+            key: Some(temp_dir.path().join("dir.key")),
+            aes256: false,
+            repeat: 1,
+        };
+        let result = run(cli);
+        assert!(
+            matches!(
+                result,
+                Err(AppError::FilesFailed {
+                    failed: 1,
+                    total: 1
+                })
+            ),
+            "expected FilesFailed, got {:?}",
+            result
+        );
+        // The file is left as it was.
+        assert_eq!(
+            std::fs::read(data_dir.join("plain.txt")).unwrap(),
+            b"not encrypted"
+        );
     }
 
     const LARGE_FILE_SIZE: usize = 500 * 1024 * 1024; // 500 MB
